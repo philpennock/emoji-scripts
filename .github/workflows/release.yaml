@@ -1,0 +1,135 @@
+# This workflow MUST be audited with zizmor.
+# This workflow SHOULD be using pinned action refs.
+# (I use 'pinact' but that's an implementation detail.)
+
+# Dev note: copied liberally from zizmor's release workflow, as "probably current best practice".
+# We can simplify the PyPI step though as we're pure Python with no compilation steps needed.
+#
+# And for the uv setup/invocations, refer to <https://docs.astral.sh/uv/guides/integration/github/>
+
+name: Release emoji-scripts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to release (e.g., v1.0.0)"
+        required: true
+
+permissions: {}
+
+jobs:
+
+  plan-release:
+    name: Plan release
+
+    runs-on: ubuntu-slim
+
+    permissions: {}
+
+    outputs:
+      release-tag: ${{ steps.determine-tag.outputs.RELEASE_TAG }}
+
+    steps:
+      - name: Determine release tag
+        id: determine-tag
+        run: echo "RELEASE_TAG=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+
+  draft-release:
+    needs: plan-release
+    name: Draft GitHub release for ${{ needs.plan-release.outputs.release-tag }}
+
+    runs-on: ubuntu-slim
+
+    permissions:
+      contents: write # to create the release
+
+    steps:
+      - name: Create draft release
+        run: |
+          # NOTE: No quotes around PRERELEASE_FLAG so that it expands to either `--prerelease` or an empty string,
+          # rather than an empty argument.
+          gh release create --repo "$GITHUB_REPOSITORY" --draft --verify-tag ${PRERELEASE_FLAG} "${RELEASE_TAG}" --title "${RELEASE_TAG}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan-release.outputs.release-tag }}
+          PRERELEASE_FLAG: ${{ contains(needs.plan-release.outputs.release-tag, '-rc') && '--prerelease' || '' }}
+
+
+  build:
+    name: Build release assets
+
+    runs-on: ubuntu-slim
+
+    permissions:
+      contents: read  # to clone repo
+      # it seems actions:write for CI artifacts is not needed, it's implicit from $ACTIONS_RUNTIME_TOKEN instead of $GITHUB_TOKEN
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.10.11"
+          enable-cache: false
+
+      - name: "Set up Python"
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: "pyproject.toml"
+
+# This will be needed for tests, once we have tests:
+#     - name: Install the project
+#       run: uv sync --locked --all-extras --dev
+
+      - name: Build
+        run: uv build --no-sources
+
+        # TODO: tests, once we have tests
+        # Reconsider runs-on if so, beware ubuntu-slim size and run duration limits
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: dist
+          path: dist/
+
+
+  pypi-publish:
+    name: Publish to PyPI for ${{ needs.plan-release.outputs.release-tag }} 🐍
+    needs: [plan-release, draft-release, build]
+
+    permissions:
+      id-token: write # for Trusted Publishing
+      # future: attestations:write with GH attestations via actions/attest-build-provenance?
+
+    runs-on: ubuntu-slim
+    environment: pypi
+
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.10.11"
+          # For a release workflow, we disable the cache, to avoid propagating a poisoned cache.
+          enable-cache: false
+
+# pinact can't handle @release/v1 so let's use 'uv publish' instead.
+#     - name: Publish package distributions to PyPI
+#       uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Publish to PyPI 🐍
+        run: uv publish --trusted-publishing=always
