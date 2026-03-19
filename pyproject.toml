@@ -1,0 +1,38 @@
+[project]
+name = "emoji-scripts"
+version = "0.1.0"
+description = "Tools for dealing with emojis"
+readme = "README.md"
+license = "ISC"
+authors = [
+  { name="Phil Pennock", email="python-pkgs@pennock-tech.com" },
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: System Administrators",
+  "Topic :: Multimedia :: Graphics",
+
+  # PEP 639 deprecates license in this list
+  #"License :: OSI Approved :: ISC License (ISCL)",
+]
+
+requires-python = ">=3.14"
+
+dependencies = [
+  "numpy>=1.20.0",
+  "pillow>=9.0.0",
+]
+
+[project.scripts]
+waveflag = "animation.waveflag:main"
+
+[build-system]
+requires=["uv_build<=0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["animation"]
+module-root = ""
+

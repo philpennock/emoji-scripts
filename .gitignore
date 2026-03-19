@@ -1,0 +1,8 @@
+/.venv/
+**/__pycache__/
+/dist/
+
+# We might include a generated requirements.in if needed, but expect the
+# pyproject.toml to be the source of truth.
+# A fully locked down requirements.txt will be a build artifact.
+/requirements.txt
