@@ -17,6 +17,9 @@ classifiers = [
   # PEP 639 deprecates license in this list
   #"License :: OSI Approved :: ISC License (ISCL)",
 ]
+keywords = [
+  "emoji", "animation",
+]
 
 requires-python = ">=3.14"
 
@@ -24,6 +27,10 @@ dependencies = [
   "numpy>=1.20.0",
   "pillow>=9.0.0",
 ]
+
+[project.urls]
+repository = "https://github.com/philpennock/emoji-scripts"
+issues = "https://github.com/philpennock/emoji-scripts/issues"
 
 [project.scripts]
 waveflag = "animation.waveflag:main"
