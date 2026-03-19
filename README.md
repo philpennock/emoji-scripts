@@ -7,6 +7,44 @@ Not, directly, Unicode emoji code-points.
 
 Creation of emojis, editing, uploading, syncing, whatever.
 
+## Tools / Scripts
+
+| Name     | Purpose                                            |
+| -------- | -------------------------------------------------- |
+| waveflag | create animated emoji with a waving-in-wind effect |
+
+## Using
+
+Depends upon the script.  If it's Python, then you should be able to use
+without installing.  For instance:
+
+```sh
+uv tool run --from emoji-scripts waveflag --help
+```
+
+For an actual conversion, given an existing input file `flag-us-pa.png`:
+
+```sh
+uv tool run --from emoji-scripts waveflag \
+  --fireworks --border-color=none flag-us-pa.png waving-us-pa.gif
+```
+
+Other language ecosystems will be addressed as they arise.
+
+For scripts, you should always be able to invoke directly from inside this
+repo; each script should include sufficient metadata to let it be run
+independently, without installing.
+
+```sh
+uv run --script animation/waveflag.py --help
+```
+
+Or you can install the script globally, using the package manager of your
+choice.
+
+
+## Developing
+
 ### Contributions
 
 Contributions, both human and AI-written, welcome, as long as a human takes
@@ -18,7 +56,7 @@ it, you're responsible for it.
 ISC.
 
 
-## Coding Practices
+### Coding Practices
 
 I have a strong preference for Python or Go for software which needs to be
 maintained, but we'll also take robust shell if it's invoking tools such as
