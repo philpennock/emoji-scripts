@@ -80,6 +80,7 @@ from PIL import Image, ImageDraw, ImageFilter
 # ---------------------------------------------------------------------------
 
 SPARKLE_STYLES = ("twinkle", "burst", "drift", "shimmer", "glitter")
+SIZE_VARY_MODES = ("random", "fixed", "crescendo")
 
 _STYLE_DOCS = {
     "twinkle": "classic 4-point star sparkles, brightening and fading (default)",
@@ -87,6 +88,12 @@ _STYLE_DOCS = {
     "drift":   "stars drift upward while twinkling",
     "shimmer": "sweeping diagonal highlight band with sparkles along the wavefront",
     "glitter": "dense small sparkles that randomly flash like fine glitter",
+}
+
+_SIZE_VARY_DOCS = {
+    "random":    "each sparkle gets a random size between 40%% and 100%% of max (default)",
+    "fixed":     "all sparkles use the same max size",
+    "crescendo": "sparkles grow larger over the animation cycle, then reset",
 }
 
 _SPARKLE_COLORS: list[tuple[int, int, int]] = [
@@ -97,6 +104,27 @@ _SPARKLE_COLORS: list[tuple[int, int, int]] = [
     (180, 255, 255),   # cyan
     (255, 255, 255),   # pure white
 ]
+
+
+# ---------------------------------------------------------------------------
+# Size specification parsing
+# ---------------------------------------------------------------------------
+
+def parse_size_spec(spec: str, image_dim: int) -> float:
+    """
+    Parse a sparkle size specification into a pixel value.
+
+    Accepts:
+        "20px"  → 20.0  (absolute pixels)
+        "15%"   → 0.15 * image_dim  (percentage of min(width, height))
+        "8"     → 8.0  (bare number treated as pixels)
+    """
+    spec = spec.strip()
+    if spec.endswith("px"):
+        return float(spec[:-2])
+    if spec.endswith("%"):
+        return float(spec[:-1]) / 100.0 * image_dim
+    return float(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +184,16 @@ class SparkleSystem:
         One of ``SPARKLE_STYLES``.
     density : float
         Multiplier for sparkle count.  1.0 = default density.
+        Ignored if *count* is set.
+    count : int or None
+        Exact number of sparkles.  Overrides *density* when set.
+    max_size : float or None
+        Maximum sparkle radius in pixels.  None = style-dependent default.
+    size_vary : str
+        Size distribution mode: ``"random"`` (default) assigns each sparkle
+        a random size between 40–100% of *max_size*.  ``"fixed"`` makes all
+        sparkles the same size.  ``"crescendo"`` ramps sizes up over the
+        animation cycle (smallest at frame 0, largest at the end).
     seed : int or None
         Random seed for reproducibility.  None = random.
     """
@@ -165,27 +203,59 @@ class SparkleSystem:
         width: int, height: int,
         n_frames: int, style: str = "twinkle",
         density: float = 1.0,
+        count: int | None = None,
+        max_size: float | None = None,
+        size_vary: str = "random",
         seed: int | None = None,
     ) -> None:
-        self.width    = width
-        self.height   = height
-        self.n_frames = n_frames
-        self.style    = style
+        self.width     = width
+        self.height    = height
+        self.n_frames  = n_frames
+        self.style     = style
+        self.size_vary = size_vary
 
         rng = random.Random(seed)
 
-        base_n = max(8, min(60, (width * height) // 400))
-        n = max(4, int(base_n * density))
+        if count is not None:
+            n = max(1, count)
+        else:
+            base_n = max(8, min(60, (width * height) // 400))
+            n = max(4, int(base_n * density))
+
+        # Default max radius depends on style; user override takes precedence
+        if max_size is not None:
+            default_max_r = max_size
+        elif style == "glitter":
+            default_max_r = 4.0
+        else:
+            default_max_r = 8.0
+
+        # Minimum radius for random variation (40% of max)
+        default_min_r = default_max_r * 0.4 if style != "glitter" else default_max_r * 0.38
 
         self.sparkles: list[dict] = []
-        for _ in range(n):
+        for idx in range(n):
             x = rng.uniform(0.02 * width,  0.98 * width)
             y = rng.uniform(0.02 * height, 0.98 * height)
+
+            # Determine this sparkle's max_r based on size_vary mode
+            if size_vary == "fixed":
+                sp_max_r = default_max_r
+            elif size_vary == "crescendo":
+                # Assign a base fraction: sparkles seeded earlier in the list
+                # correspond to earlier in the animation.  The actual crescendo
+                # scaling happens at render time (see get_layer); here we store
+                # a uniform max_r so the crescendo multiplier can scale it.
+                sp_max_r = default_max_r
+            else:
+                # "random" — each sparkle gets a random size
+                sp_max_r = rng.uniform(default_min_r, default_max_r)
+
             sp: dict = {
                 "x0":     x,
                 "y0":     y,
                 "color":  rng.choice(_SPARKLE_COLORS),
-                "max_r":  rng.uniform(3.0, 8.0),
+                "max_r":  sp_max_r,
                 "phase":  rng.uniform(0.0, 2.0 * math.pi),
                 "period": rng.uniform(0.4, 2.2),
             }
@@ -193,13 +263,13 @@ class SparkleSystem:
                 sp["vx"] = rng.uniform(-0.25, 0.25)
                 sp["vy"] = rng.uniform(-1.0, -0.3)  # upward
             if style == "glitter":
-                sp["max_r"] = rng.uniform(1.5, 4.0)
                 sp["period"] = rng.uniform(1.5, 5.0)
             self.sparkles.append(sp)
 
         # shimmer: extra parameters for the sweep band
         if style == "shimmer":
             self._shimmer_angle = math.radians(25)
+            shimmer_max_r = default_max_r * 0.6
             # spawn a second population of sparkles along the band
             for _ in range(n // 2):
                 x = rng.uniform(0.02 * width, 0.98 * width)
@@ -208,7 +278,7 @@ class SparkleSystem:
                     "x0":     x,
                     "y0":     y,
                     "color":  (255, 255, 255),
-                    "max_r":  rng.uniform(2.0, 5.0),
+                    "max_r":  rng.uniform(shimmer_max_r * 0.5, shimmer_max_r),
                     "phase":  rng.uniform(0.0, 2.0 * math.pi),
                     "period": rng.uniform(0.6, 1.8),
                     "shimmer_pop": True,
@@ -238,17 +308,29 @@ class SparkleSystem:
         draw  = ImageDraw.Draw(layer, "RGBA")
         t     = frame / max(self.n_frames, 1)  # ∈ [0, 1)
 
+        # Crescendo: scale all sizes by a ramp from ~0.2 at t=0 to 1.0 at t≈1
+        # Uses a smooth sine quarter-wave so the loop resets gracefully
+        if self.size_vary == "crescendo":
+            cresc = 0.2 + 0.8 * math.sin(t * math.pi / 2)
+        else:
+            cresc = 1.0
+
         for sp in self.sparkles:
+            # Apply crescendo scaling to the per-sparkle max_r
+            effective_sp = sp
+            if cresc != 1.0:
+                effective_sp = {**sp, "max_r": sp["max_r"] * cresc}
+
             if self.style == "twinkle":
-                self._draw_twinkle(draw, sp, t, gif_mode)
+                self._draw_twinkle(draw, effective_sp, t, gif_mode)
             elif self.style == "burst":
-                self._draw_burst(draw, sp, t, gif_mode)
+                self._draw_burst(draw, effective_sp, t, gif_mode)
             elif self.style == "drift":
-                self._draw_drift(draw, sp, t, gif_mode)
+                self._draw_drift(draw, effective_sp, t, gif_mode)
             elif self.style == "shimmer":
-                self._draw_shimmer(draw, sp, t, gif_mode)
+                self._draw_shimmer(draw, effective_sp, t, gif_mode)
             elif self.style == "glitter":
-                self._draw_glitter(draw, sp, t, gif_mode)
+                self._draw_glitter(draw, effective_sp, t, gif_mode)
 
         return layer
 
@@ -310,9 +392,8 @@ class SparkleSystem:
         max_r  = sp["max_r"]
 
         steps = t * self.n_frames
-        x     = (sp["x0"] + sp["vx"] * steps) % self.width
-        y_raw = sp["y0"] + sp["vy"] * steps
-        y     = sp["y0"] + (y_raw - sp["y0"]) % self.height if self.height > 0 else y_raw
+        x = (sp["x0"] + sp["vx"] * steps) % self.width
+        y = (sp["y0"] + sp["vy"] * steps) % self.height if self.height > 0 else sp["y0"]
 
         raw = (math.sin(2 * math.pi * period * t + phase) + 1) / 2
         b   = raw ** 1.3
@@ -410,6 +491,9 @@ def add_sparkles(
     frames: list[Image.Image],
     style: str = "twinkle",
     density: float = 1.0,
+    count: int | None = None,
+    max_size: float | None = None,
+    size_vary: str = "random",
     fps: int = 20,
     gif_mode: bool = False,
     seed: int | None = None,
@@ -428,7 +512,13 @@ def add_sparkles(
     style : str
         Sparkle style name (see ``SPARKLE_STYLES``).
     density : float
-        Sparkle count multiplier.  1.0 = default.
+        Sparkle count multiplier.  1.0 = default.  Ignored if *count* is set.
+    count : int or None
+        Exact number of sparkles.  Overrides *density*.
+    max_size : float or None
+        Maximum sparkle radius in pixels.  None = style-dependent default.
+    size_vary : str
+        Size distribution: ``"random"``, ``"fixed"``, or ``"crescendo"``.
     fps : int
         Frames per second (used for timing calculations).
     gif_mode : bool
@@ -445,7 +535,10 @@ def add_sparkles(
         return []
     w, h = frames[0].size
     n = len(frames)
-    sys = SparkleSystem(w, h, n, style=style, density=density, seed=seed)
+    sys = SparkleSystem(
+        w, h, n, style=style, density=density, count=count,
+        max_size=max_size, size_vary=size_vary, seed=seed,
+    )
     out = []
     for i, f in enumerate(frames):
         base = f.convert("RGBA")
@@ -516,6 +609,9 @@ def build_frames(
     input_frames: list[Image.Image],
     style: str = "twinkle",
     density: float = 1.0,
+    count: int | None = None,
+    max_size: float | None = None,
+    size_vary: str = "random",
     n_frames: int = 24,
     fps: int = 20,
     seed: int | None = None,
@@ -532,16 +628,16 @@ def build_frames(
     is_animated = len(input_frames) > 1
 
     if is_animated:
-        # Use the input's frame count
         n = len(input_frames)
         base_frames = input_frames
     else:
-        # Static image: replicate to n_frames
         n = n_frames
         base_frames = [input_frames[0].copy() for _ in range(n)]
 
-    is_gif = False  # determined later by caller
-    sys = SparkleSystem(w, h, n, style=style, density=density, seed=seed)
+    sys = SparkleSystem(
+        w, h, n, style=style, density=density, count=count,
+        max_size=max_size, size_vary=size_vary, seed=seed,
+    )
 
     frames: list[Image.Image] = []
     for i in range(n):
@@ -600,7 +696,20 @@ def build_parser() -> argparse.ArgumentParser:
               + "  (default: twinkle)"),
     )
     g.add_argument("--density", type=float, default=1.0, metavar="N",
-                   help="Sparkle density multiplier (default: 1.0)")
+                   help="Sparkle density multiplier (default: 1.0, ignored if --count is set)")
+    g.add_argument("--count", type=int, default=None, metavar="N",
+                   help="Exact number of sparkles (overrides --density)")
+    g.add_argument(
+        "--sparkle-size", default=None, metavar="SPEC",
+        help="Maximum sparkle size: '20px' for pixels, '15%%' for percentage "
+             "of min(width,height), or bare number for pixels (default: style-dependent)",
+    )
+    g.add_argument(
+        "--size-vary", choices=SIZE_VARY_MODES, default="random", metavar="MODE",
+        help=("Size variation: "
+              + "  ".join(f"{k} ({v})" for k, v in _SIZE_VARY_DOCS.items())
+              + "  (default: random)"),
+    )
     g.add_argument("--seed", type=int, default=None, metavar="N",
                    help="Random seed for reproducibility")
 
@@ -617,6 +726,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+
+    if Path(args.input).resolve() == Path(args.output).resolve():
+        sys.exit("Error: input and output paths are the same file")
 
     try:
         input_frames = _load_frames(args.input)
@@ -640,10 +752,25 @@ def main() -> None:
             fps = input_fps
 
     w, h = input_frames[0].size
+
+    # Parse --sparkle-size into pixels
+    max_size = None
+    if args.sparkle_size is not None:
+        try:
+            max_size = parse_size_spec(args.sparkle_size, min(w, h))
+        except ValueError:
+            sys.exit(f"Error: invalid --sparkle-size {args.sparkle_size!r}.  "
+                     "Use e.g. '20px', '15%', or a bare number")
+        if max_size <= 0:
+            sys.exit("Error: --sparkle-size must be positive")
+
+    count_str = f"count={args.count}" if args.count is not None else f"density={args.density}"
+    size_str = f"sparkle-size={args.sparkle_size}" if args.sparkle_size else ""
     print(f"Input : {args.input}  ({w}×{h}, {'animated' if is_animated else 'static'}"
           + (f", {len(input_frames)} frames" if is_animated else "") + ")")
     print(f"Output: {args.output}")
-    print(f"  style={args.style}  density={args.density}"
+    print(f"  style={args.style}  {count_str}  size-vary={args.size_vary}"
+          + (f"  {size_str}" if size_str else "")
           + (f"  seed={args.seed}" if args.seed is not None else "")
           + (f"  frames={args.frames}" if not is_animated else "")
           + f"  fps={fps}")
@@ -652,6 +779,9 @@ def main() -> None:
         input_frames,
         style=args.style,
         density=args.density,
+        count=args.count,
+        max_size=max_size,
+        size_vary=args.size_vary,
         n_frames=args.frames,
         fps=fps,
         seed=args.seed,

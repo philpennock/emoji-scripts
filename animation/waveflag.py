@@ -660,6 +660,9 @@ def _save_gif(frames: list[Image.Image], path: str, fps: int) -> None:
 def main() -> None:
     args = build_parser().parse_args()
 
+    if Path(args.input).resolve() == Path(args.output).resolve():
+        sys.exit("Error: input and output paths are the same file")
+
     try:
         src = Image.open(args.input)
     except FileNotFoundError:
