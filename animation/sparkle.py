@@ -260,8 +260,24 @@ class SparkleSystem:
                 "period": rng.uniform(0.4, 2.2),
             }
             if style == "drift":
-                sp["vx"] = rng.uniform(-0.25, 0.25)
-                sp["vy"] = rng.uniform(-1.0, -0.3)  # upward
+                # Generate random velocities, then quantize so that
+                # total displacement over n_frames is an exact multiple
+                # of the canvas dimension — guarantees seamless looping.
+                raw_vx = rng.uniform(-0.25, 0.25)
+                raw_vy = rng.uniform(-1.0, -0.3)  # upward
+                if n_frames > 0 and width > 0:
+                    kx = round(raw_vx * n_frames / width)
+                    sp["vx"] = kx * width / n_frames if kx != 0 else raw_vx
+                else:
+                    sp["vx"] = raw_vx
+                if n_frames > 0 and height > 0:
+                    ky = round(raw_vy * n_frames / height)
+                    # Ensure at least one full wrap so sparkles visibly move
+                    if ky == 0:
+                        ky = -1
+                    sp["vy"] = ky * height / n_frames
+                else:
+                    sp["vy"] = raw_vy
             if style == "glitter":
                 sp["period"] = rng.uniform(1.5, 5.0)
             self.sparkles.append(sp)
