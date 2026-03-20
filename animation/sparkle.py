@@ -570,9 +570,23 @@ def add_sparkles(
 _GIF_TRANSP = 255
 
 
-def _rgba_to_gif_palette(rgba: Image.Image) -> Image.Image:
+def _rgba_to_gif_palette(rgba: Image.Image,
+                         ref_palette: Image.Image | None = None,
+                         ) -> Image.Image:
+    """Convert an RGBA frame to a 255-colour paletted image.
+
+    If *ref_palette* is provided (a ``"P"`` mode image), the frame is
+    quantized to that existing palette instead of generating a new one.
+    This ensures identical pixels map to the same index across frames,
+    which is critical for delta-based GIF compression.
+    """
     alpha = np.asarray(rgba.split()[3])
-    q     = rgba.convert("RGB").quantize(colors=_GIF_TRANSP, dither=0)
+    if ref_palette is not None:
+        q = rgba.convert("RGB").quantize(
+            colors=_GIF_TRANSP, palette=ref_palette, dither=0,
+        )
+    else:
+        q = rgba.convert("RGB").quantize(colors=_GIF_TRANSP, dither=0)
     pal   = list(q.getpalette())[: _GIF_TRANSP * 3] + [0, 0, 0]
     arr   = np.asarray(q, dtype=np.uint8).copy()
     arr[alpha < 128] = _GIF_TRANSP
@@ -679,15 +693,130 @@ def _save_apng(frames: list[Image.Image], path: str, fps: int) -> None:
     print(f"✓  APNG saved:  {path}  ({len(frames)} frames @ {fps} fps, {ms} ms/frame)")
 
 
+def _delta_encode_gif(
+    pal_frames: list[Image.Image],
+    keyframe_interval: int = 60,
+) -> tuple[list[Image.Image], list[int]]:
+    """Delta-encode palette frames for compact GIF output.
+
+    Returns ``(encoded_frames, disposals)`` ready for
+    :pymethod:`Image.save`.
+
+    Between keyframes, each frame stores only the pixels that changed
+    relative to the *accumulated canvas* (i.e. what a GIF decoder would
+    actually show).  Unchanged pixels are set to the transparency index
+    so LZW compresses them into almost nothing, and Pillow's
+    ``optimize=True`` further crops each frame to the changed bounding
+    box.
+
+    **Keyframes** (full content, ``disposal=2``) are emitted:
+
+    * at frame 0 (always),
+    * every *keyframe_interval* frames, and
+    * whenever the number of currently-stale pixels (opaque on canvas
+      but should be transparent) exceeds 5 % of the canvas.
+
+    The last frame always uses ``disposal=2`` so the canvas is clean
+    when the GIF loops.
+    """
+    n = len(pal_frames)
+    if n == 0:
+        return [], []
+    if n == 1:
+        return list(pal_frames), [2]
+
+    palette = pal_frames[0].getpalette()
+    h, w = np.asarray(pal_frames[0]).shape
+    total_px = h * w
+
+    encoded: list[Image.Image] = [pal_frames[0]]
+    disposals: list[int] = [1]  # frame 0: keep on canvas for frame 1's delta
+
+    canvas = np.asarray(pal_frames[0]).copy()
+    # Track which pixels are currently stale (wrong) on the canvas.
+    # A pixel is stale when it's opaque on canvas but should be
+    # transparent in the true frame.
+    stale = np.zeros((h, w), dtype=bool)
+
+    for i in range(1, n):
+        curr = np.asarray(pal_frames[i])
+        is_last = (i == n - 1)
+
+        # Pixels where canvas is opaque but current frame wants transparent.
+        newly_stale = (canvas != _GIF_TRANSP) & (curr == _GIF_TRANSP) & (canvas != curr)
+        # Pixels that were stale but are now opaque again (sparkle returned
+        # or base image pixel restored) — no longer stale.
+        fixed = stale & (curr != _GIF_TRANSP)
+        stale = (stale | newly_stale) & ~fixed
+        n_stale = int(np.count_nonzero(stale))
+
+        force_key = (
+            is_last
+            or (i % keyframe_interval == 0)
+            or (n_stale > total_px * 0.05)
+        )
+
+        if force_key:
+            # Keyframe: full content.  The keyframe itself keeps
+            # disposal=1 so it stays on canvas for subsequent deltas.
+            # The *previous* frame gets disposal=2 to clear the canvas
+            # before this keyframe is drawn (ensures a clean slate).
+            encoded.append(pal_frames[i])
+            disposals.append(1)
+            canvas = curr.copy()
+            stale[:] = False
+            disposals[-2] = 2
+            if is_last:
+                # Last frame clears canvas so the loop restarts cleanly.
+                disposals[-1] = 2
+        else:
+            # Delta frame: transparent where pixel matches canvas.
+            delta = curr.copy()
+            same = (canvas == curr)
+            # Also treat stale pixels as "same" — we can't fix them
+            # with disposal=1, so don't try (leave as transparent →
+            # "keep previous").
+            same |= (stale & newly_stale)
+            delta[same] = _GIF_TRANSP
+
+            frame = Image.fromarray(delta, "P")
+            frame.putpalette(palette)
+            encoded.append(frame)
+            disposals.append(1)  # keep this frame for next delta
+
+            # Update the virtual canvas to reflect what the decoder sees.
+            # Transparent pixels in the delta mean "keep previous", so
+            # only non-transparent delta pixels update the canvas.
+            painted = (delta != _GIF_TRANSP)
+            canvas[painted] = curr[painted]
+
+    return encoded, disposals
+
+
 def _save_gif(frames: list[Image.Image], path: str, fps: int) -> None:
     ms = int(1000 / fps)
     print("  Converting to palette …", end="", flush=True)
-    pal = [_rgba_to_gif_palette(f) for f in frames]
+    # Quantize frame 0 to build a reference palette, then map every
+    # subsequent frame to the same palette so identical pixels produce
+    # identical indices — essential for delta encoding.
+    pal0 = _rgba_to_gif_palette(frames[0])
+    pal = [pal0] + [_rgba_to_gif_palette(f, ref_palette=pal0) for f in frames[1:]]
+
+    # Choose encoding strategy based on image content.  Delta encoding
+    # with disposal=1 gives large savings when the image has transparent
+    # regions (common for emoji), but for fully-opaque images Pillow's
+    # built-in disposal=2 optimization is more effective.
+    has_transparency = np.any(np.asarray(pal[0]) == _GIF_TRANSP)
+    if has_transparency:
+        encoded, disposals = _delta_encode_gif(pal)
+    else:
+        encoded, disposals = pal, 2
+
     print("\r  Writing GIF …          ", end="", flush=True)
-    pal[0].save(
-        path, format="GIF", save_all=True, append_images=pal[1:],
+    encoded[0].save(
+        path, format="GIF", save_all=True, append_images=encoded[1:],
         loop=0, duration=ms,
-        transparency=_GIF_TRANSP, disposal=2, optimize=False,
+        transparency=_GIF_TRANSP, disposal=disposals, optimize=True,
     )
     print(f"\r✓  GIF saved:   {path}  ({len(frames)} frames @ {fps} fps, {ms} ms/frame)")
 
