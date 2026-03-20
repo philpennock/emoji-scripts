@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "Pillow>=9.0.0",
+#   "numpy>=1.20.0",
+# ]
+# ///
+"""
+sparkle.py — Add animated sparkle effects to a still or animated image.
+
+Works on both static images (producing an animated output) and already-animated
+GIFs/APNGs (compositing sparkles on top of existing frames).
+
+Requirements:
+    pip install Pillow numpy
+
+Usage:
+    python sparkle.py bread.png sparkly_bread.gif
+    python sparkle.py bread.png sparkly_bread.png --style shimmer
+    python sparkle.py animated.gif with_sparkles.gif --style glitter --density 1.5
+    python sparkle.py logo.png sparkling.png --style twinkle --frames 30 --fps 24
+
+Output format is inferred from the file extension of OUTPUT:
+    .gif          Animated GIF  (256 colours, binary transparency)
+    .png / .apng  Animated PNG  (full 32-bit RGBA, better quality)
+
+Sparkle styles:
+    twinkle   Classic 4-point star sparkles that appear, brighten, and fade
+              in-place.  The quintessential "✨ freshly baked" gleam.  Default.
+    burst     8-point starburst sparks with a sharp flash and slow fade.
+              More dramatic, like a camera flash catching facets.
+    drift     Stars that drift upward while twinkling, like rising motes.
+    shimmer   A bright diagonal band that sweeps across the image, with
+              small sparkles popping along the wavefront.  Gives a "sheen"
+              or "polish" look.
+    glitter   Dense small sparkles that randomly flash like fine glitter
+              catching light.  Quick, staccato twinkles.
+
+Library usage:
+    The sparkle system is designed to be importable by other animation scripts.
+    Two approaches are supported — see "Library usage" below.
+
+    Approach 1 — High-level helper (simplest):
+
+        from animation.sparkle import add_sparkles
+
+        # frames is a list of PIL RGBA Images, all the same size
+        sparkled = add_sparkles(frames, style="twinkle", density=1.0,
+                                fps=20, gif_mode=False)
+
+    Approach 2 — Direct SparkleSystem (full control):
+
+        from animation.sparkle import SparkleSystem
+
+        sys = SparkleSystem(width=128, height=128, n_frames=24,
+                            style="shimmer", density=1.0)
+        for i in range(24):
+            layer = sys.get_layer(i, (128, 128), gif_mode=False)
+            frame = Image.alpha_composite(base_frames[i], layer)
+
+    For standalone use without installing the package, run via:
+        uv run --script animation/sparkle.py INPUT OUTPUT [options]
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import sys
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SPARKLE_STYLES = ("twinkle", "burst", "drift", "shimmer", "glitter")
+
+_STYLE_DOCS = {
+    "twinkle": "classic 4-point star sparkles, brightening and fading (default)",
+    "burst":   "8-point starburst with sharp flash and slow fade",
+    "drift":   "stars drift upward while twinkling",
+    "shimmer": "sweeping diagonal highlight band with sparkles along the wavefront",
+    "glitter": "dense small sparkles that randomly flash like fine glitter",
+}
+
+_SPARKLE_COLORS: list[tuple[int, int, int]] = [
+    (255, 255, 220),   # warm white
+    (220, 240, 255),   # cool blue-white
+    (255, 255, 160),   # bright yellow
+    (255, 210, 255),   # soft pink
+    (180, 255, 255),   # cyan
+    (255, 255, 255),   # pure white
+]
+
+
+# ---------------------------------------------------------------------------
+# Drawing primitives
+# ---------------------------------------------------------------------------
+
+def _draw_4star(
+    draw: ImageDraw.ImageDraw,
+    cx: float, cy: float,
+    r_outer: float, r_inner: float,
+    angle_offset: float,
+    color: tuple,
+) -> None:
+    """Draw a 4-point star polygon centred at (cx, cy)."""
+    pts = []
+    for i in range(8):
+        r = r_outer if i % 2 == 0 else r_inner
+        a = math.pi * i / 4 + angle_offset
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    draw.polygon(pts, fill=color)
+
+
+def _draw_cross(
+    draw: ImageDraw.ImageDraw,
+    cx: float, cy: float,
+    length: float,
+    thickness: float,
+    color: tuple,
+) -> None:
+    """Draw a thin cross (+ shape) centred at (cx, cy)."""
+    ht = thickness / 2
+    hl = length / 2
+    # horizontal bar
+    draw.rectangle([cx - hl, cy - ht, cx + hl, cy + ht], fill=color)
+    # vertical bar
+    draw.rectangle([cx - ht, cy - hl, cx + ht, cy + hl], fill=color)
+
+
+# ---------------------------------------------------------------------------
+# Sparkle system — the public API class
+# ---------------------------------------------------------------------------
+
+class SparkleSystem:
+    """
+    Pre-seeded star sparkles composited over an image on every frame.
+
+    All sparkles loop seamlessly: their brightness envelopes are based on
+    ``frame / n_frames`` so frame 0 == frame n_frames.
+
+    Parameters
+    ----------
+    width, height : int
+        Dimensions of the target canvas.
+    n_frames : int
+        Total number of animation frames.
+    style : str
+        One of ``SPARKLE_STYLES``.
+    density : float
+        Multiplier for sparkle count.  1.0 = default density.
+    seed : int or None
+        Random seed for reproducibility.  None = random.
+    """
+
+    def __init__(
+        self,
+        width: int, height: int,
+        n_frames: int, style: str = "twinkle",
+        density: float = 1.0,
+        seed: int | None = None,
+    ) -> None:
+        self.width    = width
+        self.height   = height
+        self.n_frames = n_frames
+        self.style    = style
+
+        rng = random.Random(seed)
+
+        base_n = max(8, min(60, (width * height) // 400))
+        n = max(4, int(base_n * density))
+
+        self.sparkles: list[dict] = []
+        for _ in range(n):
+            x = rng.uniform(0.02 * width,  0.98 * width)
+            y = rng.uniform(0.02 * height, 0.98 * height)
+            sp: dict = {
+                "x0":     x,
+                "y0":     y,
+                "color":  rng.choice(_SPARKLE_COLORS),
+                "max_r":  rng.uniform(3.0, 8.0),
+                "phase":  rng.uniform(0.0, 2.0 * math.pi),
+                "period": rng.uniform(0.4, 2.2),
+            }
+            if style == "drift":
+                sp["vx"] = rng.uniform(-0.25, 0.25)
+                sp["vy"] = rng.uniform(-1.0, -0.3)  # upward
+            if style == "glitter":
+                sp["max_r"] = rng.uniform(1.5, 4.0)
+                sp["period"] = rng.uniform(1.5, 5.0)
+            self.sparkles.append(sp)
+
+        # shimmer: extra parameters for the sweep band
+        if style == "shimmer":
+            self._shimmer_angle = math.radians(25)
+            # spawn a second population of sparkles along the band
+            for _ in range(n // 2):
+                x = rng.uniform(0.02 * width, 0.98 * width)
+                y = rng.uniform(0.02 * height, 0.98 * height)
+                self.sparkles.append({
+                    "x0":     x,
+                    "y0":     y,
+                    "color":  (255, 255, 255),
+                    "max_r":  rng.uniform(2.0, 5.0),
+                    "phase":  rng.uniform(0.0, 2.0 * math.pi),
+                    "period": rng.uniform(0.6, 1.8),
+                    "shimmer_pop": True,
+                })
+
+    def get_layer(
+        self, frame: int, size: tuple[int, int], gif_mode: bool = False
+    ) -> Image.Image:
+        """
+        Render sparkle layer for the given frame.
+
+        Parameters
+        ----------
+        frame : int
+            Current frame index.
+        size : tuple[int, int]
+            (width, height) of the output layer.
+        gif_mode : bool
+            If True, use binary alpha (255 or 0) for GIF compatibility.
+
+        Returns
+        -------
+        Image.Image
+            RGBA layer with sparkles drawn on a transparent background.
+        """
+        layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        draw  = ImageDraw.Draw(layer, "RGBA")
+        t     = frame / max(self.n_frames, 1)  # ∈ [0, 1)
+
+        for sp in self.sparkles:
+            if self.style == "twinkle":
+                self._draw_twinkle(draw, sp, t, gif_mode)
+            elif self.style == "burst":
+                self._draw_burst(draw, sp, t, gif_mode)
+            elif self.style == "drift":
+                self._draw_drift(draw, sp, t, gif_mode)
+            elif self.style == "shimmer":
+                self._draw_shimmer(draw, sp, t, gif_mode)
+            elif self.style == "glitter":
+                self._draw_glitter(draw, sp, t, gif_mode)
+
+        return layer
+
+    # -- Individual style renderers -----------------------------------------
+
+    def _draw_twinkle(
+        self, draw: ImageDraw.ImageDraw, sp: dict, t: float, gif_mode: bool
+    ) -> None:
+        color  = sp["color"]
+        phase  = sp["phase"]
+        period = sp["period"]
+        max_r  = sp["max_r"]
+
+        raw = math.sin(2 * math.pi * period * t + phase)
+        b   = max(0.0, raw) ** 1.5
+        if b < 0.04:
+            return
+        r     = max_r * b
+        alpha = 255 if gif_mode else int(b * 255)
+        col   = (*color, alpha)
+        _draw_4star(draw, sp["x0"], sp["y0"], r, r * 0.28, -math.pi / 4, col)
+        # bright centre dot
+        cr = r * 0.28
+        draw.ellipse(
+            [sp["x0"] - cr, sp["y0"] - cr, sp["x0"] + cr, sp["y0"] + cr],
+            fill=col,
+        )
+
+    def _draw_burst(
+        self, draw: ImageDraw.ImageDraw, sp: dict, t: float, gif_mode: bool
+    ) -> None:
+        color  = sp["color"]
+        phase  = sp["phase"]
+        period = sp["period"]
+        max_r  = sp["max_r"]
+
+        raw = math.sin(2 * math.pi * period * t + phase)
+        b   = max(0.0, raw) ** 0.6
+        if b < 0.04:
+            return
+        r     = max_r * b
+        alpha = 255 if gif_mode else int(b * 240)
+        col   = (*color, alpha)
+        # Two 4-point stars at 45° offset → 8-point starburst
+        _draw_4star(draw, sp["x0"], sp["y0"], r,        r * 0.18, -math.pi / 4, col)
+        _draw_4star(draw, sp["x0"], sp["y0"], r * 0.75, r * 0.18, 0.0,          col)
+        cr = r * 0.25
+        draw.ellipse(
+            [sp["x0"] - cr, sp["y0"] - cr, sp["x0"] + cr, sp["y0"] + cr],
+            fill=(255, 255, 255, alpha),
+        )
+
+    def _draw_drift(
+        self, draw: ImageDraw.ImageDraw, sp: dict, t: float, gif_mode: bool
+    ) -> None:
+        color  = sp["color"]
+        phase  = sp["phase"]
+        period = sp["period"]
+        max_r  = sp["max_r"]
+
+        steps = t * self.n_frames
+        x     = (sp["x0"] + sp["vx"] * steps) % self.width
+        y_raw = sp["y0"] + sp["vy"] * steps
+        y     = sp["y0"] + (y_raw - sp["y0"]) % self.height if self.height > 0 else y_raw
+
+        raw = (math.sin(2 * math.pi * period * t + phase) + 1) / 2
+        b   = raw ** 1.3
+        r   = max_r * max(0.25, b)
+        alpha = 255 if gif_mode else int(b * 220)
+        col   = (*color, alpha)
+        _draw_4star(draw, x, y, r, r * 0.28, -math.pi / 4, col)
+
+    def _draw_shimmer(
+        self, draw: ImageDraw.ImageDraw, sp: dict, t: float, gif_mode: bool
+    ) -> None:
+        color  = sp["color"]
+        phase  = sp["phase"]
+        period = sp["period"]
+        max_r  = sp["max_r"]
+
+        # The shimmer sweep: a diagonal band moves across the image
+        # Band position sweeps from -0.3 to 1.3 across the image
+        band_pos = (t * 1.6 - 0.3) % 1.6  # wraps seamlessly
+
+        # Project sparkle position onto the sweep direction
+        nx = sp["x0"] / max(self.width, 1)
+        ny = sp["y0"] / max(self.height, 1)
+        proj = nx * math.cos(self._shimmer_angle) + ny * math.sin(self._shimmer_angle)
+
+        # Distance from sparkle to the band centre
+        dist = abs(proj - band_pos)
+        band_width = 0.18
+
+        if sp.get("shimmer_pop"):
+            # Sparkles along the wavefront: bright when the band passes over them
+            if dist > band_width:
+                return
+            proximity = 1.0 - (dist / band_width)
+            b = proximity ** 0.8
+            r = max_r * b
+            alpha = 255 if gif_mode else int(b * 230)
+            col = (*color, alpha)
+            _draw_4star(draw, sp["x0"], sp["y0"], r, r * 0.3, -math.pi / 4, col)
+        else:
+            # Background sparkles: also triggered by the band, with some independence
+            raw = math.sin(2 * math.pi * period * t + phase)
+            b_base = max(0.0, raw) ** 1.5
+
+            # Boost brightness when the band passes nearby
+            if dist < band_width * 1.5:
+                proximity = 1.0 - (dist / (band_width * 1.5))
+                b = max(b_base, proximity ** 0.6 * 0.9)
+            else:
+                b = b_base * 0.3  # dim background twinkle
+            if b < 0.06:
+                return
+            r = max_r * b
+            alpha = 255 if gif_mode else int(b * 240)
+            col = (*color, alpha)
+            _draw_4star(draw, sp["x0"], sp["y0"], r, r * 0.28, -math.pi / 4, col)
+            cr = r * 0.25
+            draw.ellipse(
+                [sp["x0"] - cr, sp["y0"] - cr, sp["x0"] + cr, sp["y0"] + cr],
+                fill=col,
+            )
+
+    def _draw_glitter(
+        self, draw: ImageDraw.ImageDraw, sp: dict, t: float, gif_mode: bool
+    ) -> None:
+        color  = sp["color"]
+        phase  = sp["phase"]
+        period = sp["period"]
+        max_r  = sp["max_r"]
+
+        # Glitter: short, sharp flashes — use a triangle wave with a narrow peak
+        raw = math.sin(2 * math.pi * period * t + phase)
+        # Only flash in a narrow band around the peak
+        b = max(0.0, (raw - 0.7) / 0.3) if raw > 0.7 else 0.0
+        if b < 0.05:
+            return
+        r = max_r * b
+        alpha = 255 if gif_mode else int(b * 255)
+        col = (*color, alpha)
+        # Simple cross shape for glitter
+        _draw_cross(draw, sp["x0"], sp["y0"], r * 2, max(1.0, r * 0.3), col)
+        # Tiny centre dot
+        cr = max(0.5, r * 0.3)
+        draw.ellipse(
+            [sp["x0"] - cr, sp["y0"] - cr, sp["x0"] + cr, sp["y0"] + cr],
+            fill=(255, 255, 255, alpha),
+        )
+
+
+# ---------------------------------------------------------------------------
+# High-level helper — the easiest library API
+# ---------------------------------------------------------------------------
+
+def add_sparkles(
+    frames: list[Image.Image],
+    style: str = "twinkle",
+    density: float = 1.0,
+    fps: int = 20,
+    gif_mode: bool = False,
+    seed: int | None = None,
+) -> list[Image.Image]:
+    """
+    Composite sparkle effects onto a list of RGBA frames.
+
+    This is the simplest way to use the sparkle system from another script.
+    It creates a :class:`SparkleSystem`, renders each frame's sparkle layer,
+    and alpha-composites it onto the corresponding input frame.
+
+    Parameters
+    ----------
+    frames : list[Image.Image]
+        Input frames (all same size, RGBA mode).
+    style : str
+        Sparkle style name (see ``SPARKLE_STYLES``).
+    density : float
+        Sparkle count multiplier.  1.0 = default.
+    fps : int
+        Frames per second (used for timing calculations).
+    gif_mode : bool
+        If True, sparkles use binary alpha for GIF compatibility.
+    seed : int or None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    list[Image.Image]
+        New list of RGBA frames with sparkles composited.
+    """
+    if not frames:
+        return []
+    w, h = frames[0].size
+    n = len(frames)
+    sys = SparkleSystem(w, h, n, style=style, density=density, seed=seed)
+    out = []
+    for i, f in enumerate(frames):
+        base = f.convert("RGBA")
+        layer = sys.get_layer(i, (w, h), gif_mode=gif_mode)
+        out.append(Image.alpha_composite(base, layer))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GIF palette conversion
+# ---------------------------------------------------------------------------
+
+_GIF_TRANSP = 255
+
+
+def _rgba_to_gif_palette(rgba: Image.Image) -> Image.Image:
+    alpha = np.asarray(rgba.split()[3])
+    q     = rgba.convert("RGB").quantize(colors=_GIF_TRANSP, dither=0)
+    pal   = list(q.getpalette())[: _GIF_TRANSP * 3] + [0, 0, 0]
+    arr   = np.asarray(q, dtype=np.uint8).copy()
+    arr[alpha < 128] = _GIF_TRANSP
+    out   = Image.fromarray(arr, "P")
+    out.putpalette(pal)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Input loading (static or animated)
+# ---------------------------------------------------------------------------
+
+def _load_frames(path: str) -> list[Image.Image]:
+    """
+    Load all frames from an image file.
+
+    For animated GIF/APNG, returns every frame as RGBA.
+    For static images, returns a single-element list.
+    """
+    img = Image.open(path)
+    frames = []
+    try:
+        while True:
+            frames.append(img.convert("RGBA").copy())
+            img.seek(img.tell() + 1)
+    except EOFError:
+        pass
+    if not frames:
+        frames.append(img.convert("RGBA").copy())
+    return frames
+
+
+def _get_input_fps(path: str) -> int | None:
+    """Try to read the frame duration from an animated image."""
+    try:
+        img = Image.open(path)
+        duration = img.info.get("duration", None)
+        if duration and duration > 0:
+            return max(1, round(1000 / duration))
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Frame assembly
+# ---------------------------------------------------------------------------
+
+def build_frames(
+    input_frames: list[Image.Image],
+    style: str = "twinkle",
+    density: float = 1.0,
+    n_frames: int = 24,
+    fps: int = 20,
+    seed: int | None = None,
+) -> list[Image.Image]:
+    """
+    Build sparkle animation frames from input frame(s).
+
+    If input_frames has one element (static image), the sparkle animation
+    creates n_frames output frames.  If input_frames has multiple elements
+    (animated input), sparkles are composited onto each existing frame and
+    n_frames is ignored.
+    """
+    w, h = input_frames[0].size
+    is_animated = len(input_frames) > 1
+
+    if is_animated:
+        # Use the input's frame count
+        n = len(input_frames)
+        base_frames = input_frames
+    else:
+        # Static image: replicate to n_frames
+        n = n_frames
+        base_frames = [input_frames[0].copy() for _ in range(n)]
+
+    is_gif = False  # determined later by caller
+    sys = SparkleSystem(w, h, n, style=style, density=density, seed=seed)
+
+    frames: list[Image.Image] = []
+    for i in range(n):
+        print(f"\r  Building frame {i + 1}/{n} …", end="", flush=True)
+        base = base_frames[i].convert("RGBA")
+        layer = sys.get_layer(i, (w, h), gif_mode=False)
+        frames.append(Image.alpha_composite(base, layer))
+
+    print()
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Output savers
+# ---------------------------------------------------------------------------
+
+def _save_apng(frames: list[Image.Image], path: str, fps: int) -> None:
+    ms = int(1000 / fps)
+    frames[0].save(
+        path, format="PNG", save_all=True, append_images=frames[1:],
+        loop=0, duration=ms,
+    )
+    print(f"✓  APNG saved:  {path}  ({len(frames)} frames @ {fps} fps, {ms} ms/frame)")
+
+
+def _save_gif(frames: list[Image.Image], path: str, fps: int) -> None:
+    ms = int(1000 / fps)
+    print("  Converting to palette …", end="", flush=True)
+    pal = [_rgba_to_gif_palette(f) for f in frames]
+    print("\r  Writing GIF …          ", end="", flush=True)
+    pal[0].save(
+        path, format="GIF", save_all=True, append_images=pal[1:],
+        loop=0, duration=ms,
+        transparency=_GIF_TRANSP, disposal=2, optimize=False,
+    )
+    print(f"\r✓  GIF saved:   {path}  ({len(frames)} frames @ {fps} fps, {ms} ms/frame)")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("input",  metavar="INPUT",  help="Source image (JPEG/PNG/GIF/APNG/…)")
+    p.add_argument("output", metavar="OUTPUT", help="Output animation (.gif / .png / .apng)")
+
+    g = p.add_argument_group("sparkle")
+    g.add_argument(
+        "--style", choices=SPARKLE_STYLES, default="twinkle", metavar="STYLE",
+        help=("Sparkle style: "
+              + "  ".join(f"{k} ({v})" for k, v in _STYLE_DOCS.items())
+              + "  (default: twinkle)"),
+    )
+    g.add_argument("--density", type=float, default=1.0, metavar="N",
+                   help="Sparkle density multiplier (default: 1.0)")
+    g.add_argument("--seed", type=int, default=None, metavar="N",
+                   help="Random seed for reproducibility")
+
+    g = p.add_argument_group("animation")
+    g.add_argument("--frames", type=int, default=24, metavar="N",
+                   help="Number of frames for static input (default: 24, ignored for animated input)")
+    g.add_argument("--fps", type=int, default=20, metavar="N",
+                   help="Frames per second (default: 20, or inherited from animated input)")
+    g.add_argument("--size", metavar="WxH",
+                   help="Resize the input image before processing, e.g. 128x128")
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    try:
+        input_frames = _load_frames(args.input)
+    except FileNotFoundError:
+        sys.exit(f"Error: cannot open {args.input!r}")
+
+    is_animated = len(input_frames) > 1
+
+    if args.size:
+        try:
+            rw, rh = (int(d) for d in args.size.lower().split("x", 1))
+        except ValueError:
+            sys.exit("Error: --size must be WxH, e.g. 128x128")
+        input_frames = [f.resize((rw, rh), Image.LANCZOS) for f in input_frames]
+
+    # Inherit fps from animated input if not explicitly set
+    fps = args.fps
+    if is_animated:
+        input_fps = _get_input_fps(args.input)
+        if input_fps is not None and args.fps == 20:  # 20 is the default
+            fps = input_fps
+
+    w, h = input_frames[0].size
+    print(f"Input : {args.input}  ({w}×{h}, {'animated' if is_animated else 'static'}"
+          + (f", {len(input_frames)} frames" if is_animated else "") + ")")
+    print(f"Output: {args.output}")
+    print(f"  style={args.style}  density={args.density}"
+          + (f"  seed={args.seed}" if args.seed is not None else "")
+          + (f"  frames={args.frames}" if not is_animated else "")
+          + f"  fps={fps}")
+
+    frames = build_frames(
+        input_frames,
+        style=args.style,
+        density=args.density,
+        n_frames=args.frames,
+        fps=fps,
+        seed=args.seed,
+    )
+
+    ext = Path(args.output).suffix.lower()
+    if ext == ".gif":
+        _save_gif(frames, args.output, fps)
+    elif ext in (".png", ".apng"):
+        _save_apng(frames, args.output, fps)
+    else:
+        sys.exit(
+            f"Error: unknown output extension {ext!r}.  Use .gif, .png, or .apng"
+        )
+
+
+if __name__ == "__main__":
+    main()
