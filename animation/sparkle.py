@@ -701,11 +701,12 @@ def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return out + crc
 
 
-def _compress_rgba_subframe(img: Image.Image) -> bytes:
+def _compress_subframe(img: Image.Image) -> bytes:
     """Return raw PNG IDAT payload (deflate-compressed, with filter bytes).
 
-    Uses Pillow to encode a single RGBA frame and then extracts the
-    IDAT data, which is the same byte sequence we need for fdAT.
+    Uses Pillow to encode a single frame (RGBA or P mode) and then
+    extracts the IDAT data, which is the same byte sequence we need
+    for fdAT.
     """
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
@@ -730,62 +731,67 @@ def _compress_rgba_subframe(img: Image.Image) -> bytes:
 
 
 def _save_apng(frames: list[Image.Image], path: str, fps: int) -> None:
-    """Write an APNG with manual delta encoding.
+    """Write an APNG with manual delta encoding in palette mode.
 
-    Unlike GIF, APNG offers two blend modes per frame:
+    Quantizes all frames to a shared 255-colour palette (index 255 =
+    transparent), then delta-encodes using APNG's blend modes:
 
-    * **OP_OVER** (1): the sub-frame is alpha-composited onto the
-      canvas.  Fully-transparent pixels leave the canvas unchanged,
-      allowing us to zero-out unmodified pixels *within* the
-      bounding-box for dramatically better deflate compression.
+    * **OP_OVER** delta frames: unchanged pixels are set to the
+      transparent index.  Under ``OP_OVER``, transparent = "keep
+      canvas", so only changed pixels affect the output.  At 1
+      byte/pixel (vs 4 for RGBA), deflate compresses the mostly-
+      uniform rows extremely well.
 
-    * **OP_SOURCE** (0): the sub-frame *replaces* the canvas region,
-      including transparent pixels erasing opaque ones.  Used when a
-      pixel transitions from visible → transparent — something
-      ``OP_OVER`` cannot represent.
+    * **OP_SOURCE** keyframes: periodic full-content frames that
+      correct accumulated stale pixels from opaque→transparent
+      transitions that ``OP_OVER`` cannot represent.
 
-    We write the APNG ourselves (rather than via Pillow's
-    ``save_all``) because Pillow's ``_write_multiple_frames``
-    re-computes its own bounding boxes and ignores our pre-zeroed
-    deltas.
+    Using palette mode gives us the colour-depth efficiency of GIF
+    (1 byte/pixel) combined with APNG's superior ``OP_OVER`` blend
+    and PNG's deflate compression.
     """
     ms = int(1000 / fps)
     delay_num = ms
     delay_den = 1000
     n = len(frames)
     w, h = frames[0].size
-    print("  Delta-encoding …", end="", flush=True)
+    print("  Quantizing palette …", end="", flush=True)
 
-    # ---- Build sub-frame data for each frame ----
-    # Each entry: (sub_img, x, y, dispose_op, blend_op)
+    # ---- Quantize to shared palette ----
+    pal0 = _rgba_to_gif_palette(frames[0])
+    pal_frames = [pal0] + [
+        _rgba_to_gif_palette(f, ref_palette=pal0) for f in frames[1:]
+    ]
+    palette = pal0.getpalette()  # 768-byte RGB list
+
+    print("\r  Delta-encoding …    ", end="", flush=True)
+
+    # ---- Build sub-frame data ----
+    # Each entry: (sub_img "P" mode, x, y, dispose_op, blend_op)
     DISPOSE_NONE = 0
     BLEND_SOURCE = 0
     BLEND_OVER = 1
 
     sub_frames: list[tuple[Image.Image, int, int, int, int]] = []
+    sub_frames.append((pal_frames[0], 0, 0, DISPOSE_NONE, BLEND_SOURCE))
 
-    # Frame 0: always full, source blend.
-    sub_frames.append((frames[0], 0, 0, DISPOSE_NONE, BLEND_SOURCE))
-
-    # Track accumulated canvas state to detect stale pixels.
-    canvas = np.asarray(frames[0]).copy()
+    canvas = np.asarray(pal_frames[0]).copy()
     keyframe_interval = 60
     stale = np.zeros((h, w), dtype=bool)
 
     for i in range(1, n):
-        curr = np.asarray(frames[i])
-        diff = (canvas != curr).any(axis=2)
+        curr = np.asarray(pal_frames[i])
+        diff = (canvas != curr)
 
         if not diff.any():
-            # Identical — emit a 1×1 transparent patch (APNG requires
-            # a frame; Pillow merges durations but we write manually).
-            patch = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            patch = Image.new("P", (1, 1), _GIF_TRANSP)
+            patch.putpalette(palette)
             sub_frames.append((patch, 0, 0, DISPOSE_NONE, BLEND_OVER))
             continue
 
-        # Track opaque→transparent transitions (can't fix with OP_OVER).
-        newly_stale = diff & (canvas[:, :, 3] > 0) & (curr[:, :, 3] == 0)
-        fixed = stale & (curr[:, :, 3] > 0)
+        # Track opaque→transparent transitions.
+        newly_stale = diff & (canvas != _GIF_TRANSP) & (curr == _GIF_TRANSP)
+        fixed = stale & (curr != _GIF_TRANSP)
         stale = (stale | newly_stale) & ~fixed
         n_stale = int(np.count_nonzero(stale))
 
@@ -795,10 +801,9 @@ def _save_apng(frames: list[Image.Image], path: str, fps: int) -> None:
         )
 
         if force_key:
-            # OP_SOURCE keyframe: full content, resets canvas perfectly.
-            # Pillow auto-crops it to the content bbox via the diff
-            # against what was on canvas.
-            sub_frames.append((frames[i], 0, 0, DISPOSE_NONE, BLEND_SOURCE))
+            sub_frames.append(
+                (pal_frames[i], 0, 0, DISPOSE_NONE, BLEND_SOURCE)
+            )
             canvas = curr.copy()
             stale[:] = False
             continue
@@ -809,65 +814,63 @@ def _save_apng(frames: list[Image.Image], path: str, fps: int) -> None:
         r0, r1 = int(np.argmax(rows)), int(h - 1 - np.argmax(rows[::-1]))
         c0, c1 = int(np.argmax(cols)), int(w - 1 - np.argmax(cols[::-1]))
 
-        # OP_OVER delta: zero unchanged pixels inside bbox so PNG's
-        # deflate compresses the mostly-zero rows efficiently.
-        # Alpha=0 under OP_OVER = "keep canvas" → perfect delta.
+        # OP_OVER delta: transparent index where unchanged.
         sub = curr[r0:r1+1, c0:c1+1].copy()
         local_diff = diff[r0:r1+1, c0:c1+1]
-        sub[~local_diff] = (0, 0, 0, 0)
+        sub[~local_diff] = _GIF_TRANSP
 
-        sub_img = Image.fromarray(sub, "RGBA")
+        sub_img = Image.fromarray(sub, "P")
+        sub_img.putpalette(palette)
         sub_frames.append((sub_img, c0, r0, DISPOSE_NONE, BLEND_OVER))
 
-        # Update virtual canvas: OP_OVER only paints non-transparent.
-        painted = (sub != 0).any(axis=2) if sub.ndim == 3 else (sub != 0)
+        # Update virtual canvas.
+        painted = sub != _GIF_TRANSP
         canvas[r0:r1+1, c0:c1+1][painted] = curr[r0:r1+1, c0:c1+1][painted]
 
     # ---- Assemble the APNG file ----
     print("\r  Writing APNG …       ", end="", flush=True)
 
-    # PNG signature
     out = b"\x89PNG\r\n\x1a\n"
 
-    # IHDR
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    # IHDR — color type 3 (indexed), bit depth 8
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 3, 0, 0, 0)
     out += _png_chunk(b"IHDR", ihdr)
 
+    # PLTE — palette (256 entries × 3 bytes)
+    plte_data = bytes(palette[:256 * 3])
+    out += _png_chunk(b"PLTE", plte_data)
+
+    # tRNS — palette transparency: all opaque except index 255
+    trns_data = bytes([255] * _GIF_TRANSP + [0])
+    out += _png_chunk(b"tRNS", trns_data)
+
     # acTL — animation control
-    actl = struct.pack(">II", n, 0)  # num_frames, num_plays (0 = infinite)
+    actl = struct.pack(">II", n, 0)
     out += _png_chunk(b"acTL", actl)
 
-    seq = 0  # APNG sequence number (shared across fcTL and fdAT)
+    seq = 0
 
     for idx, (sub_img, x, y, dispose_op, blend_op) in enumerate(sub_frames):
         sw, sh = sub_img.size
 
-        # fcTL — frame control
         fctl = struct.pack(
             ">IIIIIHHBB",
-            seq,            # sequence_number
-            sw, sh,         # width, height
-            x, y,           # x_offset, y_offset
-            delay_num,      # delay_numerator
-            delay_den,      # delay_denominator
-            dispose_op,     # dispose_op
-            blend_op,       # blend_op
+            seq, sw, sh, x, y,
+            delay_num, delay_den,
+            dispose_op, blend_op,
         )
         out += _png_chunk(b"fcTL", fctl)
         seq += 1
 
-        idat_data = _compress_rgba_subframe(sub_img)
+        idat_data = _compress_subframe(sub_img)
 
         if idx == 0:
-            # Frame 0 uses IDAT (required for backwards compat).
             out += _png_chunk(b"IDAT", idat_data)
         else:
-            # Subsequent frames use fdAT (= sequence_number + IDAT data).
             fdat = struct.pack(">I", seq) + idat_data
             out += _png_chunk(b"fdAT", fdat)
             seq += 1
 
-    # IEND
     out += _png_chunk(b"IEND", b"")
 
     with open(path, "wb") as f:
