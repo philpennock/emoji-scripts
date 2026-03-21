@@ -4,15 +4,15 @@
 # dependencies = []
 # ///
 """
-apng-info.py — Inspect APNG frame structure.
+apng_info.py — Inspect APNG frame structure.
 
 Reports per-frame sub-image dimensions, offsets, blend/dispose modes,
 and compressed data sizes by parsing fcTL and fdAT/IDAT chunks directly.
 No dependencies beyond the standard library.
 
 Usage:
-    python apng-info.py FILE.apng [FILE2.apng ...]
-    python apng-info.py --help
+    python apng_info.py FILE.apng [FILE2.apng ...]
+    python apng_info.py --help
 """
 from __future__ import annotations
 
